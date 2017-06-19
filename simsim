@@ -3,7 +3,6 @@
 require 'logger'
 require 'socket'
 require 'pp'
-require 'awesome_print'
 
 # event exception
 class Transit < StandardError
@@ -339,7 +338,7 @@ end
 
 
 def print_states
-  ap @simulator
+  pp @simulator
 end
 
 def do_event_loop

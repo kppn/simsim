@@ -662,6 +662,10 @@ PeerB向け、PeerC向けにそれぞれsimsimを起動し、2つのsimsim間で
 設計されました。
 
 
+## Requirements
+* Ruby > 2.4.1
+
+
 ## Q&A
 
 ##### Q TCPは使えないの？

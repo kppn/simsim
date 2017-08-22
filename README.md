@@ -681,7 +681,8 @@ PeerB向け、PeerC向けにそれぞれsimsimを起動し、2つのsimsim間で
 
 
 ## Requirements
-* Ruby > 2.4.1
+* Ruby >= 2.4.1
+* Gem: openssl-cmac
 
 
 ## Q&A
@@ -703,13 +704,18 @@ PeerB向け、PeerC向けにそれぞれsimsimを起動し、2つのsimsim間で
         end
 
         define
-          class.define_method('my_method') do |arg|
+          def self.my_method(arg)
             # ...
           end
         end
 
     もしあなたがRubyistなら次の一言で理解できるでしょう。  
     「simsimは全てをSimulatorクラスの1つのインスタンスの中で処理する」
+
+##### 信号送信後にソケットエラーで落ちるんだけど？
+
+    simsimが送信したUDPパケットに対してピアからICMP Unreachableが送信されている可能性があります。
+    ソケットエラーは大抵の場合はコンフィグやシナリオの誤りであるため、simsimでは敢えてエラー回復を入れていません。
 
 ##### Q アクションの途中で処理をやめたい
 

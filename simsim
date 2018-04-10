@@ -4,308 +4,650 @@ require 'logger'
 require 'socket'
 require 'pp'
 
-# event exception
+
+
+#--------------------------
+# state
+#--------------------------
+
+class State
+  attr_reader :name
+
+  def initialize(context, name, &block)
+    @context = context
+    @name = name
+    @block = block
+
+    @events = []
+  end
+
+  def exec
+    @context.instance_eval &@block
+  end
+
+  def <<(event)
+    @events << event
+  end
+
+  def fetch_event(signal)
+    @events.find{|event| event.match?(signal)}
+  end
+end
+
+
+class States
+  attr_reader :current
+
+  def initialize(context)
+    @context = context
+    @states = []
+  end
+
+  def add(name, &block)
+    state = State.new(@context, name, &block)
+    self << state 
+    state.exec
+  end
+
+  def init
+    @current = find(:initial)
+  end
+
+  def <<(state)
+    @states << state
+    @current = state
+  end
+
+  def find(name)
+    @states.find{|state| state.name == name}
+  end
+
+  def to(state_name)
+    state = @states.find{|s| s.name == state_name}
+    @current = state if state
+  end
+end
+
+
+#--------------------------
+# event definition management on scenario
+#--------------------------
+
+class Event
+  def initialize(context, action)
+    @context = context
+    @action = action
+  end
+
+  def line
+    src, line = @action.source_location
+    "#{File.basename(src)}:#{line}"
+  end
+
+  def fire
+    @context.instance_eval &@action
+  end
+end
+
+
+class InEvent < Event
+  def match?(signal)
+    signal.kind_of? InSignal
+  end
+end
+
+
+class OutEvent < Event
+  def match?(signal)
+    signal.kind_of? OutSignal
+  end
+end 
+
+
+class ReceiveEvent < Event
+  attr_accessor :peer_name
+
+  def initialize(context, action, condition, peer_name)
+    super(context, action)
+    @condition = condition
+    @peer_name = peer_name
+  end
+
+  def match?(signal)
+    return false unless signal.kind_of? ReceiveSignal
+    return false unless @peer_name == signal.peer.name
+
+    condition = @condition
+    @context.instance_exec do
+      peer = peers.find(@peer_name)
+      @sig = peer.proto_klass.from_bytes(signal.bytes, *@decode_params)
+    end
+    @context.instance_exec &condition
+  end
+end
+
+
+class TimerEvent < Event
+  attr_accessor :name
+
+  def initialize(context, action, name)
+    super(context, action)
+    @name = name
+  end
+
+  def match?(signal)
+    return false unless signal.kind_of? TimerSignal
+
+    @name == signal.name
+  end
+end
+
+
+class ControlEvent < Event
+  attr_accessor :name, :value
+
+  def initialize(context, action, name, value = nil)
+    super(context, action)
+    @name = name
+    @value = value
+  end
+
+  def match?(signal)
+    return false unless signal.kind_of? ControlSignal
+
+    name == signal.name && value == signal.value
+  end
+end
+
+
+
+#--------------------------
+# signal definitions
+#
+#   InSignal and OutSignal is pseudo signal to occure event
+#--------------------------
+
+class InSignal
+end
+
+
+class OutSignal
+end
+
+
+class ReceiveSignal
+  attr_accessor :bytes, :peer
+
+  def initialize(bytes)
+    @bytes = bytes
+  end
+
+  def self.from(bytes)
+    self.new(bytes)
+  end
+
+end
+
+
+class TimerSignal
+  attr_accessor :name, :bytes
+
+  Type = 1
+
+  def initialize(name)
+    @name = name.to_sym
+  end
+
+  def encode
+    [Type].pack('C') + @name.to_s
+  end
+
+  def self.from(bytes)
+    self.new(bytes.to_sym).tap{|signal|
+      signal.bytes = bytes
+    }
+  end
+
+  def self.mine?(bytes)
+    bytes.unpack('C').first == Type
+  end
+end
+
+
+class ControlSignal
+  attr_accessor :name, :value, :bytes
+
+  Type = 2
+
+  def initialize(name, value = nil)
+    @name = name.to_sym
+    @value = value
+  end
+
+  def encode
+    if @value
+      [Type, @name.to_s].pack('CA*')
+    else
+      [Type, @name.to_s, 0, @value].pack('CA*CC')
+    end
+  end
+
+  def self.from(bytes)
+    name, value = bytes.split("\x0")
+    value = value&.unpack('C')&.first
+    self.new(name, value).tap{|signal|
+      signal.bytes = bytes
+    }
+  end
+
+  def self.mine?(bytes)
+    bytes.unpack('C').first == Type
+  end
+end
+
+
+#--------------------------
+# Exception for transit instruction
+#
+#   "transit" have to incarnate global jump.
+#   so, use Ruby raise/error mechanism
+#--------------------------
+
 class Transit < StandardError
-  attr_accessor :before_state, :after_state
+  attr_accessor :before, :after
+
+  def initialize(before, after)
+    super()
+
+    @before = before
+    @after = after
+  end
 end
 
-# receiver
+
+#--------------------------
+# Packet Receivers
+#--------------------------
+
 class SignalReceiver < UDPSocket
-#  def read_nonblock(*args)
-#  def recv_nonblock(*args)
-   def recv
-    raw_data = super(65535)
-    [raw_data, Simulator::EventKind::Signal]
-  end
-end
+  def initialize(own)
+    super()
 
-# internal event receiver
-class EventReceiver < UDPSocket
-#  def read_nonblock(*args)
-#  def recv_nonblock(*args)
+    own_ip, own_port = own.split(/:/)
+    bind(own_ip, own_port.to_i)
+  end
+
+  def send(bytes)
+    super bytes, 0
+  end
+
   def recv
-    raw_data = super(65535)
-    kind = raw_data[0].unpack('C').shift
-    data = raw_data[1..-1]
-    [data, kind]
+    super(65536)
   end
 end
 
-# State-Event-Action table
+
+class InternalSignalReceiver < SignalReceiver
+  def initialize(own)
+    super(own)
+  end
+
+  def send(data)
+    _, port, _, ip = self.addr
+    sock = UDPSocket.new
+    sock.send data, 0, Socket.sockaddr_in(port, ip)
+    sock.close
+  end
+
+  def recv
+    raw_data = super
+
+    kind = raw_data.unpack('C').first
+
+    signal = 
+      case kind
+      when 1
+        TimerSignal.from(raw_data[1..-1])
+      when 2
+        ControlSignal.from(raw_data[1..-1])
+      else
+        nil
+      end
+
+    signal
+  end
+end
+
+
+class ExternalSignalReceiver < SignalReceiver
+  def initialize(own, dst)
+    super(own)
+
+    dst_ip, dst_port = dst.split(/:/)
+    connect(dst_ip, dst_port.to_i)
+  end
+
+  def send(bytes)
+    super
+  end
+
+  def recv
+    raw_data = super
+
+    ReceiveSignal.new(raw_data)
+  end
+end
+
+
+
+#--------------------------
+# Peer management
+#--------------------------
+
+class Peer
+  attr_accessor :name, :receiver, :proto_klass
+
+  def initialize(name, receiver, proto_klass)
+    @name = name
+    @receiver = receiver 
+    @proto_klass = proto_klass
+  end
+
+  def send(bytes)
+    receiver.send bytes
+  end
+
+  def recv
+    signal = receiver.recv
+    signal.peer = self
+
+    signal
+  end
+end
+
+
+class InternalPeer
+  attr_accessor :receiver, :name
+  attr_reader :proto_class  # always nil
+
+  def initialize(receiver)
+    @receiver = receiver 
+    @name = :__internal
+  end
+
+  def send(bytes)
+    receiver.send bytes
+  end
+
+  def recv
+    receiver.recv
+  end
+end
+
+
+class PeerContainer
+  def initialize(context)
+    @context = context
+    @peers = []
+  end
+
+  def add(peer)
+    @peers << peer
+  end
+
+  def exec_for(name, &block)
+    if peer = find(name)
+      peer.instance_exec &block
+    end
+  end
+
+  def find(name)
+    @peers.find{|p| p.name == name}
+  end
+
+  def find_internal
+    find(:__internal)
+  end
+
+  def recv
+    receiver_peers = {}
+    @peers.each do |peer|
+      receiver_peers[peer.receiver] = peer
+    end
+
+    selected_receivers, _ = IO::select [* receiver_peers.keys]
+    peer = receiver_peers[selected_receivers.first]
+    signal = peer.recv
+
+    signal
+  end
+end
+
+
+#--------------------------
+# Timer management
+#--------------------------
+
+class Timer
+  attr_reader :name
+
+  def initialize(peer, name, time)
+    @peer = peer
+    @name = name
+    @time = time
+  end
+
+  def start(container)
+    begin
+      @thread = Thread.new(@name, @time, @peer, container) do |name, time,peer, container|
+        sleep time
+        peer.send TimerSignal.new(name).encode
+        container.delete(name)
+      end
+    rescue => e
+      p e
+    end
+  end
+
+  def stop
+    @thread.kill
+  end
+end
+
+
+class TimerContainer
+  def initialize
+    @timers = {}
+  end
+
+  def add_and_start(timer)
+    @timers[timer.name] = timer
+    timer.start(self)
+  end
+
+  def delete(timer_name)
+    if timer = find(timer_name)
+      timer.stop
+      @timers.delete timer_name
+    end
+  end
+
+  def find(timer_name)
+    @timers[timer_name]
+  end
+end
+
+
+
+#--------------------------
+# Simulator 
 #
-# @__states = {
-#   initial: {
-#     in_action: Proc,
-#     out_action: Proc,
-#     receives: [
-#       {peer_name: Symbol|nil, cond: Proc, action: Proc},
-#       ...
-#     ],
-#     timers: {
-#       Symbol: Proc,
-#       ...
-#     },
-#     controls: {
-#       [Symbol, Numeric] => Proc,
-#       ...
-#     }
-#   },
-#   hoge: {
-#   },
-#   ...
-# }
-#
+#   main class for simsim
+#--------------------------
 
 class Simulator
-  module EventKind
-    Signal     = 0
-    Timer      = 1
-    Control    = 2
-  end
-  # event packet structure 
-  #   Signal
-  #     0      : 0
-  #     1..-1  : signal data (Binary String)
-  #
-  #   Timer
-  #     0      : 1
-  #     2..-1  : timer name (String)
-  #
-  #   Control "\x2(controlname)[\x0[controlvalue]]"
-  #     0      : 2
-  #     1...n  : control name (String)
-  #     n      : separator "\x0", optional
-  #     n+1    : control value, 1oct, optional
-
-  def initialize(sig_receiver, proto_klass, ev_receiver, logger)
+  def initialize(logger, internal_ip_port)
     @logger = logger
 
-    add_peer(sig_receiver, nil, proto_klass)
-    @__ev_receiver = ev_receiver
-    @__current_state = :initial
-
-    @__active_timers = {}
-
-    @logger.info "event socket: #{ev_receiver.addr[3]}:#{ev_receiver.addr[1]}"
+    internal_peer = make_internal_peer(internal_ip_port)
+    peers.add internal_peer
+    timers
+    states
   end
 
+  #--------------------------
+  # top level methods
+  #--------------------------
+  def state(state_name, &block)
+    states.add state_name, &block
+  end
 
+  def define(&block)
+    self.instance_eval &block
+  end
 
   #--------------------------
   # Action Triggers
   #--------------------------
-  def in_action(&block)
-    @__state[:in_action] = block
+  def in_action(&action)
+    register_event InEvent.new(self, action)
   end
 
-  def out_action(&block)
-    @__state[:out_action] = block
+  def out_action(&action)
+    register_event OutEvent.new(self, action)
   end
 
-  def receive(cond, peer_name = nil, &block)
-    @__state[:receives] << {peer_name: peer_name, cond: cond, action: block}
+  def receive(cond, peer_name = nil, &action)
+    register_event ReceiveEvent.new(self, action, cond, peer_name)
   end
 
-  def expire(timer_name, &block)
-    @__state[:timers][timer_name] = block
-  end
-
-  def control(control_name, value = nil, &block)
-    key = value ? [control_name, value] : [control_name]
-    @__state[:controls][key] = block
-  end
-
-  #--------------------------
-  # in action functios
-  #--------------------------
   def P(&block)
     Proc.new &block
   end
 
-  def send(*args)
-    name, sig = if args.length == 2
-                  args
-                else
-                  [nil, *args]
-                end
-    @logger.info "send: #{name}, #{sig.each_byte.map{|x| "%02x" % x}.join}"
-
-    # @__peers[sig_receiver] = { name: name.to_sym, proto_klass: proto_klass }
-    sock, _ = @__peers.find{|_, peer_info| peer_info[:name] == name} 
-
-    sock.send sig, 0
+  def expire(timer_name, &action)
+    register_event TimerEvent.new(self, action, timer_name)
   end
 
-  def transit(name)
-    @logger.info "transit: #{@__current_state} -> #{name}"
+  def control(control_name, value = nil, &action)
+    register_event ControlEvent.new(self, action, control_name, value)
+  end
 
-    transit = Transit.new
-    transit.before_state = @__current_state
-    transit.after_state = name
+
+  #--------------------------
+  # in action methods
+  #--------------------------
+  def send(*args)
+    name = args.length == 2 ? args.shift : nil
+    sig = args.shift
+
+    peers.exec_for(name) {
+      send sig
+    }
+
+    @logger.info "send: #{name}, #{sig.each_byte.map{|x| "%02x" % x}.join}"
+  end
+
+  def transit(to_name)
+    transit = Transit.new(states.current.name, to_name)
+
+    @logger.info "transit: #{states.current.name} -> #{to_name}"
 
     raise transit
   end
 
   def start_timer(timer_name, time)
+    timers.delete timer_name
+
     @logger.info "start timer: #{timer_name} #{time}"
 
-    stop_active_timer!(@__active_timers, timer_name)
-
-    _, port, _, ip = @__ev_receiver.addr
-    th = Thread.new(timer_name, time, ip, port) do |timer_name, time|
-      data = [EventKind::Timer].pack('C') + timer_name.to_s
-      sleep time
-      UDPSocket.new.send(data, 0, ip, port)
-    end
-    @__active_timers[timer_name] = th
+    timers.add_and_start Timer.new(peers.find_internal, timer_name, time)
   end
 
   def stop_timer(timer_name)
+    timers.delete timer_name
+
     @logger.info "stop timer: #{timer_name}"
-
-    stop_active_timer!(@__active_timers, timer_name)
   end
 
   #--------------------------
-  # support functions
+  # support methods
   #--------------------------
-  def define(block)
-    self.instance_eval &block
+  def init
+    states.init
   end
 
+  def add_peer(peer)
+    peers.add peer
 
-
-  def add_state(state_name, &block)
-    @__states ||= {}
-
-    @__state = { receives: [], timers: {}, controls: {}}
-    self.instance_eval &block
-
-    @__states[state_name] = @__state
-  end
-
-  def add_peer(sig_receiver, name, proto_klass)
-    name_msg = name ? ":#{name}" : ""
-    @logger.info "signal socket: #{sig_receiver.addr[3]}:#{sig_receiver.addr[1]} #{name_msg} #{proto_klass.to_s}"
-
-    @__peers ||= {}
-    @__peers[sig_receiver] = { name: name&.to_sym, proto_klass: proto_klass }
+    @logger.info "signal socket: #{peer.receiver.addr[3]}:#{peer.receiver.addr[1]} #{peer.name} #{peer.proto_klass.to_s}"
   end
 
   def event_loop
-    # do :initial :in_action
-    begin
-      do_in_action(@__states, @__current_state)
-    rescue Transit => e
-      do_out_action(@__states, @__current_state)
-      @__current_state = e.after_state
-      do_in_action(@__states, @__current_state)
-    end
-
+    fire_initial_event
     loop do
-      begin
-        socks, _ = IO::select [*@__peers.keys, @__ev_receiver]
-        sock = socks.first
-
-        signal, event_kind = sock.recv
-
-        if sock == @__ev_receiver
-          peer_name = nil
-        else
-          peer_info = @__peers[sock]
-          peer_name = peer_info[:name]
-          @sig = peer_info[:proto_klass].from_bytes(signal, *@decode_params)
-        end
-
-        events = @__states[@__current_state]
-
-        if action = fetch_action(events, event_kind, peer_name, signal)
-          self.instance_eval(&action)
-        else
-          @logger.info "!!! no match event: #{signal.each_byte.map{|x| "%02x" % x}.join }"
-        end
-      rescue Transit => e
-        do_out_action(@__states, @__current_state)
-        @__current_state = e.after_state
-        do_in_action(@__states, @__current_state)
-      end
+      signal = peers.recv
+      fetch_and_fire! signal
     end
+  end
+
+  def peers
+    @__peer_container ||= PeerContainer.new(self)
+  end
+
+  def states
+    @__states ||= States.new(self)
+  end
+
+  def timers
+    @__timer_container ||= TimerContainer.new
   end
 
 
   private
 
-  def fetch_action(events, event_kind, peer_name, signal)
-    case event_kind
-    when EventKind::Signal
-      return fetch_signal_action(events[:receives], peer_name, signal)
-    when EventKind::Timer
-      return fetch_timer_action(events[:timers], signal)
-    when EventKind::Control
-      return fetch_control_action(events[:controls], signal)
-    end
-    nil
+  def make_internal_peer(ip_port)
+    InternalPeer.new(InternalSignalReceiver.new(ip_port)).tap{|peer|
+      @logger.info "event socket: #{peer.receiver.addr[3]}:#{peer.receiver.addr[1]}"
+    }
   end
 
-  def fetch_signal_action(events, peer_name, signal)
-    target_event =
-      events.find{|event|
-        event[:peer_name] == peer_name &&
-        self.instance_exec(& event[:cond])
-      }
-
-    from_msg = peer_name ? "from :#{peer_name}" : ""
-    target_event_line_msg = target_event ? "line #{target_event[:cond].source_location[1]}" : ""
-    @logger.info "signal event occured: #{from_msg} #{target_event_line_msg}"
-
-    return nil unless target_event
-
-    target_event[:action]
+  def register_event(event)
+    states.current << event
   end
 
-  def fetch_timer_action(events, signal)
-    timer_name = signal.to_sym
-    @logger.info "timer event occured: #{timer_name}"
-    events[timer_name]
-  end
-
-  def fetch_control_action(events, signal)
-    control_name, value = signal.split("\x0")
-    @logger.info "control event occured: #{control_name} #{value ? value.unpack('C').shift : ''}"
-    key = if value
-            [control_name.to_sym, value.unpack('C').shift]
-          else
-            [control_name.to_sym]
-          end
-    events[key]
-  end
-
-  def do_out_action(states, current_state)
-    action = states[current_state][:out_action]
-    if action
-      self.instance_eval &action
+  def fire_initial_event
+    begin
+      states.current.fetch_event(InSignal.new)&.fire
+    rescue Transit => transit
+      do_transit transit.after
     end
   end
 
-  def do_in_action(states, current_state)
-    action = states[current_state][:in_action]
-    if action
-      self.instance_eval &action
+  def fetch_and_fire!(signal)
+    begin
+      if event = states.current.fetch_event(signal)
+        @logger.info "match event: #{event.line}"
+        event.fire
+      else
+        @logger.info "!!! no match event: #{signal.class}, #{signal.bytes.each_byte.map{|x| "%02x" % x}.join }"
+      end
+    rescue Transit => transit
+      do_transit transit.after
     end
   end
 
-  def stop_active_timer!(timers, timer_name)
-    if th = timers[timer_name]
-      th.kill
-      timers.delete(timer_name)
-    end
+  def do_transit(name)
+    states.current.fetch_event(OutSignal.new)&.fire
+    states.to name
+    states.current.fetch_event(InSignal.new)&.fire
   end
 end
 
 
-def init_simulator(receiver, proto_klass, ev_receiver, logger)
-  @simulator ||= Simulator.new(receiver, proto_klass, ev_receiver, logger)
-end
+#--------------------------
+# config methods
+#--------------------------
 
 def log(progname, io_target = STDOUT)
   @logger = Logger.new(io_target)
@@ -314,43 +656,24 @@ def log(progname, io_target = STDOUT)
 end
 
 def peer(*args)
-  name, own, dst, proto = if args.length == 3
-                            [nil, *args]
-                          else
-                            args
-                          end
-  own_ip, own_port = own.split(/:/)
-  dst_ip, dst_port = dst.split(/:/)
+  name = args.length == 3 ? nil : args.shift
+  own, dst, proto = args
 
-  sock = SignalReceiver.new
-  sock.bind(own_ip, own_port.to_i)
-  sock.connect(dst_ip, dst_port.to_i)
-
-  @sig_sockets ||= []
-  @sig_sockets << [sock, name, proto]
-end
-
-def add_sig_sockets
-  @sig_sockets.each do |sock_info|
-    @simulator.add_peer(* sock_info)
-  end
+  @peers ||= []
+  @peers << Peer.new(name, ExternalSignalReceiver.new(own, dst), proto)
 end
 
 
-def print_states
-  pp @simulator
-end
-
-def do_event_loop
-  @simulator.event_loop
-end
+#--------------------------
+# scenario methods
+#--------------------------
 
 def state(state_name, &block)
-  @simulator.add_state(state_name, &block)
+  @simulator.state(state_name, &block)
 end
 
 def define(&block)
-  @simulator.define(block)
+  @simulator.define &block
 end
 
 
@@ -358,32 +681,24 @@ end
 # main
 #=================================================-
 
-ev_receiver = EventReceiver.new
-ev_receiver.bind('127.0.0.1', 0)
+
+# load config
+config_name = ARGV.length == 2 ? ARGV.shift : 'config'
+require_relative config_name
+
+# new Simulator
+@simulator = Simulator.new(@logger, internal_ip_port = '127.0.0.1:0')
+
+# save internal socket ip/port to file
+_, port, _, ip = @simulator.peers.find_internal.receiver.addr
 File.open('event.sock', 'w') do |f|
-  _, port, _, ip = ev_receiver.addr
   f.puts "#{ip}:#{port}"
 end
 
-if ARGV.length == 2
-  require_relative ARGV.shift   # load config
-else
-  require_relative 'config'
-end
+# register peers
+@peers.each{|peer| @simulator.add_peer peer}
 
-# initialize simulator
-sig_socket = @sig_sockets.shift
-init_simulator(
-  sig_socket[0],
-  sig_socket[2],
-  ev_receiver,
-  @logger
-)
-
-add_sig_sockets
-
-
-# load scenario file
+# load scenario file(s)
 unless ARGV.empty?
   ARGV.each do |scenario_file|
     require_relative scenario_file
@@ -393,5 +708,6 @@ else
 end
 
 # execute
-do_event_loop
+@simulator.init
+@simulator.event_loop
 

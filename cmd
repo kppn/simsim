@@ -26,8 +26,6 @@ ip, port = if dst =~ /[0-9.]+:[0-9]+/
              end
            end
 
-p ip
-p port
 
 socket = UDPSocket.new
 socket.connect(ip, port)
@@ -37,12 +35,17 @@ case command_name
 when 'timer'
   data = "\x01" + ARGV.shift.to_s
   socket.send data, 0
+
+  puts "send timer for #{ip}:#{port}"
+
 when 'control'
   data = "\x02" + ARGV.shift
   if value = ARGV.shift
     data += "\x00" + [value.to_i].pack('C')
   end
   socket.send data, 0
+
+  puts "send control(#{data},#{value}) for #{ip}:#{port}"
 end
 
 

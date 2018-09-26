@@ -650,6 +650,7 @@ end
 #--------------------------
 
 def log(progname, io_target = STDOUT)
+  STDOUT.sync = true
   @logger = Logger.new(io_target)
   @logger.progname = progname
   @logger.level = Logger::DEBUG

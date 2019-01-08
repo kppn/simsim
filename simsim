@@ -368,7 +368,7 @@ end
 
 class InternalPeer
   attr_accessor :receiver, :name
-  attr_reader :proto_class  # always nil
+  attr_reader :proto_klass  # always nil
 
   def initialize(receiver)
     @receiver = receiver 

@@ -118,8 +118,9 @@ class ReceiveEvent < Event
     return false unless @peer_name == signal.peer.name
 
     condition = @condition
+    peer_name = @peer_name
     @context.instance_exec do
-      peer = peers.find(@peer_name)
+      peer = peers.find(peer_name)
       @sig = peer.proto_klass.from_bytes(signal.bytes, *@decode_params)
     end
     @context.instance_exec &condition
